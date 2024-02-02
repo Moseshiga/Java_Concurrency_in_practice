@@ -1,3 +1,5 @@
+#TODO: бонусом сделать анализ всей concurrency библиотеки 
+
 # То, что узнал в книге "Java Concurrency in practice" 
 
 ## Описание
@@ -710,6 +712,289 @@ dependent)
 станет истинным, и затем продолжают выполнение операции. (wait и notify)
 
 ### 4.1.3. Владение состоянием
+
+При определении переменных, формирующих состояние объекта, мы учитываем только те данные, которыми 
+объект владеет. Владение не воплощено в языке явным образом, а является элементом проектирования 
+класса.
+
+Во многих случаях владение связано с инкапсуляцией — объект инкапсулирует состояние, которым владеет, 
+и владеет состоянием, которое инкапсулирует. Именно владелец переменной состояния принимает решение о 
+замковом протоколе, используемом для поддержания целостности ее состояния. Из факта владения вытекает 
+обязанность контроля, которая после публикации ссылки на мутируемый объект приобретет совместный 
+характер. Класс не владеет объектами, поставляемыми в его методы или конструкторы, если сам метод не 
+предназначен для явной передачи права владения.
+
+## 4.2. Ограничение одним экземпляром
+
+Инкапсуляция данных в объекте ограничивает доступ к ним только методами объекта, что упрощает 
+обеспечение постоянного доступа с удержанием замка.
+
+Использование ограничения одним экземпляром
+
+```java
+@ThreadSafe
+public class PersonSet {
+    @GuardedBy("this")
+    private final Set<Person> mySet = new HashSet<Person>();
+    public synchronized void addPerson(Person p) {
+        mySet.add(p);
+    }
+    public synchronized boolean containsPerson(Person p) {
+        return mySet.contains(p);
+    }
+}
+```
+
+Ограничение одним экземпляром (synchronized) упрощает создание потокобезопасных классов, позволяя 
+анализировать их потокобезопасность без проверки всей программы.
+
+### 4.2.1. Мониторный шаблон Java
+
+По принципу ограничения одним экземпляром работает и мониторный шаблон Java (Java monitor pattern)1: 
+объект, подчиняющийся шаблону, инкапсулирует мутируемое состояние под защитой внутреннего замка.
+
+Защита состояния с помощью приватного замка
+
+```java
+public class PrivateLock {
+    private final Object myLock = new Object();
+    @GuardedBy("myLock") Widget widget;
+    void someMethod() {
+        synchronized(myLock) {
+            // Обратиться и изменить состояние виджета
+        }
+    }
+}
+```
+
+Преимущество использования приватного замка — в его инкапсуляции, которая не позволяет клиентскому 
+коду приобрести его и участвовать в политике его синхронизации, избавляя от необходимости проверки 
+всей программы.
+
+### 4.2.2. Пример: трекинг такси
+
+Наш трекер такси будет программой для диспетчера таксопарка. Сначала мы построим его с помощью 
+мониторного шаблона, а затем ослабим требования к инкапсуляции, сохраняя потокобезопасность.
+
+Каждое такси будет идентифицироваться объектом String и иметь местоположение в координатах (x, y). 
+Классы VehicleTracker инкапсулируют идентичность и местоположения известных такси
+
+Просмотровый поток будет доставлять имена и местоположения такси и выводить их на дисплей:
+
+```java
+Map<String, Point> locations = vehicles.getLocations();
+for (String key : locations.keySet())
+    renderVehicle(key, locations.get(key));
+```
+
+Так же изменение координат:
+
+```java
+void vehicleMoved(VehicleMovedEvent evt) {
+    Point loc = evt.getNewLocation();
+    vehicles.setLocation(evt.getVehicleId(), loc.x, loc.y);
+}
+```
+
+Потоки будут обращаться к модели данных конкурентно, и она должна быть потокобезопасной.
+(Сам пример будет описан в последующих главах)
+
+### 4.3. Делегирование потокобезопасности
+
+Мониторная реализация трекера такси
+
+```java
+@ThreadSafe
+public class MonitorVehicleTracker {
+    @GuardedBy("this")
+    private final Map<String, MutablePoint> locations;
+    public MonitorVehicleTracker( Map<String, MutablePoint> locations) {
+        this.locations = deepCopy(locations);
+    }
+    public synchronized Map<String, MutablePoint> getLocations() {
+        return deepCopy(locations);
+    }
+    public synchronized MutablePoint getLocation(String id) {
+        MutablePoint loc = locations.get(id);
+        return loc == null ? null : new MutablePoint(loc);
+    }
+    public synchronized void setLocation(String id, int x, int y) {
+        MutablePoint loc = locations.get(id);
+        if (loc == null) throw new IllegalArgumentException("No such ID: " + id);
+        loc.x = x;
+        loc.y = y;
+    }
+    private static Map<String, MutablePoint> deepCopy(Map<String, MutablePoint> m) {
+        Map<String, MutablePoint> result = new HashMap<String, MutablePoint>();
+        for (String id : m.keySet()) result.put(id, new MutablePoint(m.get(id)));
+        return Collections.unmodifiableMap(result);
+    }
+}
+// Изменяемый класс точки, подобный java.awt.Point
+@NotThreadSafe
+public class MutablePoint {
+    public int x, y;
+    public MutablePoint() { x = 0; y = 0; }
+    public MutablePoint(MutablePoint p) {
+        this.x = p.x;
+        this.y = p.y;
+    }
+}
+```
+
+### 4.3.1. Пример: трекер такси с использованием делегирования
+
+Давайте сконструируем версию трекера такси, которая делегирует свои обязанности по потокобезопасности 
+неизменяемому классу. Местоположения хранятся в ассоциативном массиве Map, поэтому мы начнем с 
+потокобезопасной реализации хеш-массива ConcurrentHashMap.
+
+Неизменяемый класс точки Point, используемый трекером DelegatingVehicleTracker
+
+```java
+@Immutable
+public class Point {
+    public final int x, y;
+    public Point(int x, int y) {
+        this.x = x;
+        this.y = y;
+    }
+}
+```
+
+Класс Point является потокобезопасным, поэтому нам больше не нужно копировать местоположения при их 
+возврате.
+
+Делегирование потокобезопасности в хеш-массив ConcurrentHashMap
+
+```java
+@ThreadSafe
+public class DelegatingVehicleTracker {
+    private final ConcurrentMap<String, Point> locations;
+    private final Map<String, Point> unmodifiableMap;
+    public DelegatingVehicleTracker(Map<String, Point> points) {
+        locations = new ConcurrentHashMap<String, Point>(points);
+        unmodifiableMap = Collections.unmodifiableMap(locations);
+    }
+    public Map<String, Point> getLocations() {
+        return unmodifiableMap;
+    }
+    public Point getLocation(String id) {
+        return locations.get(id);
+    }
+    public void setLocation(String id, int x, int y) {
+        if (locations.replace(id, new Point(x, y)) == null)
+            throw new IllegalArgumentException("недопустимое имя такси: " + id);
+    }
+}
+```
+
+Обратите внимание, что мы немного изменили поведение класса трекера такси: мониторная версия 
+возвращала снимок местоположений, а делегирующая версия возвращает их неизменяемое, но «живое» 
+представление. Это означает, что если поток A вызывает метод getLocations, а поток B позже изменяет 
+местоположение некоторых точек, эти изменения отражаются в хеш-массиве, возвращенном потоку A. Как мы 
+отмечали ранее, это может быть преимуществом (более актуальные данные) либо недостатком (потенциально 
+противоречивое представление таксопарка), в зависимости от ваших требований.
+
+Если требуется неизменное представление парка, то метод getLocations может вернуть неглубокую копию 
+хеш-массива местоположений.
+
+### 4.3.2. Независимые переменные состояния
+
+Делегировать потокобезопасность более чем одной базовой переменной состояния возможно, если эти 
+переменные независимы, то есть композитный класс не накладывает инварианты с их участием.
+
+Делегирование потокобезопасности нескольким базовым переменным состояния
+
+```java
+public class VisualComponent {
+    private final List<KeyListener> keyListeners = new CopyOnWriteArrayList<KeyListener>();
+    private final List<MouseListener> mouseListeners = new CopyOnWriteArrayList<MouseListener>();
+    public void addKeyListener(KeyListener listener) {
+        keyListeners.add(listener);
+    }
+    public void addMouseListener(MouseListener listener) {
+        mouseListeners.add(listener);
+    }
+    public void removeKeyListener(KeyListener listener) {
+        keyListeners.remove(listener);
+    }
+    public void removeMouseListener(MouseListener listener) {
+        mouseListeners.remove(listener);
+    }
+}
+```
+
+Каждый список является потокобезопасным, и поскольку нет ограничений между их состояниями, 
+VisualComponent может делегировать свои обязанности по потокобезопасности базовым объектам 
+mouseListeners и keyListeners.
+
+### 4.3.3. Случаи безуспешного делегирования
+
+Класс диапазона чисел, недостаточно защищающий свои инварианты. Так делать не следует
+
+```java
+public class NumberRange {
+    // ИНВАРИАНТ: lower <= upper
+    private final AtomicInteger lower = new AtomicInteger(0);
+    private final AtomicInteger upper = new AtomicInteger(0);
+    public void setLower(int i) {
+        // Предупреждение – небезопасная операция "проверить и затем действовать"
+        if (i > upper.get()) 
+            throw new IllegalArgumentException("не могу установить lower равным " + i + " > upper");
+        lower.set(i);
+    }
+    public void setUpper(int i) {
+        // Предупреждение – небезопасная операция "проверить и затем действовать"
+        if (i < lower.get()) 
+            throw new IllegalArgumentException("не могу установить upper равным " + i + " < lower");
+        upper.set(i);
+    }
+    public boolean isInRange(int i) {
+        return (i >= lower.get() && i <= upper.get());
+    }
+}
+```
+Класс NumberRange не является потокобезопасным: он не соблюдает инвариант, который ограничивает lower 
+и upper. Методы setLower и setUpper пытаются соблюсти этот инвариант, но безуспешно, так как являются 
+последовательностями операций «проверить и затем действовать», но их блокировка не обеспечивает им 
+атомарности. Если в диапазоне (0, 10) один поток вызовет setLower(5), а другой в то же время — 
+setUpper(4), то при неудачной временнˆой координации оба потока пройдут проверку в методах доступа 
+set, и выполнятся два изменения, создав диапазон (5, 4) — недопустимое состояние.
+
+Потокобезопасность класса NumberRange может обеспечить блокировка, которая сохранит его инварианты и 
+защитит lower и upper замком, чтобы препятствовать их публикации.
+
+### 4.3.4. Публикация базовых переменных состояния
+
+Если переменная состояния является потокобезопасной, не участвует в инвариантах, ограничивающих ее 
+значение, и не имеет запрещенных переходов из состояния в состояние для любой из ее операций, то она 
+может быть безопасно опубликована.
+
+### 4.3.5. Пример: трекер такси, публикующий свое состояние
+
+Рассмотрим версию трекера такси с публикацией базового мутируемого состояния путем размещения на мутируемых, но 
+потокобезопасных точках.
+
+Класс потокобезопасной мутируемой точки
+
+@ThreadSafe
+public class SafePoint {
+@GuardedBy("this") private int x, y;
+private SafePoint(int[] a) { this(a[0], a[1]); }
+public SafePoint(SafePoint p) { this(p.get()); }
+public SafePoint(int x, int y) {
+this.x = x;
+this.y = y;
+}
+
+
+
+
+
+
+
+
+
 
 
 
