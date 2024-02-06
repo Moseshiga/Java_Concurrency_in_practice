@@ -1607,15 +1607,12 @@ public class BoundedHashSet<T> {
 ожидания других потоков.
 
 Класс CyclicBarrier позволяет фиксированному числу сторон неоднократно назначать встречу в барьерной 
-точке. Он полезен в параллельных итеративных алгоритмах, которые разбивают задачу на фиксированное 
-число независимых подзадач. Потоки достигают барьерной точки и вызывают метод await, который 
-блокирует продвижение, пока все потоки не сделают то же самое. Если барьер успешно пройден, все 
-потоки выпускаются, и барьер переустанавливается для следующего использования. Если время на вызов 
-метода await истекает либо блокированный им поток прерывается, барьер считается неисправным, и все 
-вызовы метода await, ожидающие обработки, терминируются с исключением BrokenBarrierException. Если 
-барьер успешно пройден, то метод await возвращает уникальный индекс прибытия каждому потоку. 
-CyclicBarrier также позволяет передавать барьерное действие конструктору, реализуя интерфейс Runnable 
-в одном из подзадачных потоков, после прохождения барьера, но до освобождения блокированных потоков.
+точке. Потоки достигают барьерной точки и вызывают метод await, который  блокирует продвижение, пока 
+все потоки не сделают то же самое. Если барьер успешно пройден, все потоки выпускаются, и барьер 
+переустанавливается для следующего использования.  Если барьер успешно пройден, то метод await 
+возвращает уникальный индекс прибытия каждому потоку.  CyclicBarrier также позволяет передавать 
+барьерное действие конструктору, реализуя интерфейс Runnable в одном из подзадачных потоков, после 
+прохождения барьера, но до освобождения блокированных потоков.
 
 Координирование вычислений в клеточном автомате с помощью барьера CyclicBarrier
 
@@ -1662,16 +1659,173 @@ public class CellularAutomata {
 }
 ```
 
+Еще одной формой барьера является обменник Exchanger — двухсторонний барьер, в котором стороны 
+обмениваются данными в барьерной точке.
 
+## 5.6. Создание эффективного масштабируемого кэша результатов
 
+Первоначальный подход к кэшированию с использованием HashMap и синхронизации
 
+```java
+public interface Computable<A, V> {
+    V compute(A arg) throws InterruptedException;
+}
+public class ExpensiveFunction
+        implements Computable<String, BigInteger> {
+    public BigInteger compute(String arg) {
+        // после глубокого раздумья...
+        return new BigInteger(arg);
+    }
+}
+public class Memoizer1<A, V> implements Computable<A, V> {
+    @GuardedBy("this")
+    private final Map<A, V> cache = new HashMap<A, V>();
+    private final Computable<A, V> c;
+    public Memoizer1(Computable<A, V> c) {
+        this.c = c;
+    }
+    public synchronized V compute(A arg) throws InterruptedException {
+        V result = cache.get(arg);
+        if (result == null) {
+            result = c.compute(arg);
+            cache.put(arg, result);
+        }
+        return result;
+    }
+}
+```
 
+![image](https://github.com/Moseshiga/Java_Concurrency_in_practice/assets/46221930/e2fc4ee5-b36f-4c02-bb7a-cf16522f376e)
 
+Как результат получаем слабую конкурентность класса Memoizer1.
 
+Замена HashMap на ConcurrentHashMap
 
+```java
+public class Memoizer2<A, V> implements Computable<A, V> {
+    private final Map<A, V> cache = new ConcurrentHashMap<A, V>();
+    private final Computable<A, V> c;
+    public Memoizer2(Computable<A, V> c) { this.c = c; }
+    public V compute(A arg) throws InterruptedException {
+        V result = cache.get(arg);
+        if (result == null) {
+            result = c.compute(arg);
+            cache.put(arg, result);
+        }
+        return result;
+    }
+}
+```
 
+![image](https://github.com/Moseshiga/Java_Concurrency_in_practice/assets/46221930/e675f700-ff3b-464f-ab0d-78a0f268ff93)
 
+Два потока вычисляют одно и то же значение при использовании Memoizer2
 
+Запоминающая обертка с использованием FutureTask
 
+```java
+public class Memoizer3<A, V> implements Computable<A, V> {
+    private final Map<A, Future<V>> cache
+            = new ConcurrentHashMap<A, Future<V>>();
+    private final Computable<A, V> c;
+    public Memoizer3(Computable<A, V> c) { this.c = c; }
+    public V compute(final A arg) throws InterruptedException {
+        Future<V> f = cache.get(arg);
+        if (f == null) {
+            Callable<V> eval = new Callable<V>() {
+                public V call() throws InterruptedException {
+                    return c.compute(arg);
+                }
+            };
+            FutureTask<V> ft = new FutureTask<V>(eval);
+            f = ft;
+            cache.put(arg, ft);
+            ft.run(); // вызов c.compute происходит тут
+        }
+        try {
+            return f.get();
+        } catch (ExecutionException e) {
+            throw launderThrowable(e.getCause());
+        }
+    }
+}
+```
+
+Реализация класса Memoizer3 демонстрирует очень хорошую конкурентность, но остается окно уязвимости 
+(оно меньше, чем в Memoizer2), в котором два потока могут вычислить одно и то же значение. Блок if в 
+методе compute по-прежнему является неатомарной последовательностью «проверить и затем действовать», 
+и два потока могут одновременно вызвать метод compute с одним и тем же значением, увидеть, что кэш не 
+содержит желаемого значения, и начать вычисление.
+
+![image](https://github.com/Moseshiga/Java_Concurrency_in_practice/assets/46221930/aef8a05c-464b-4f63-8a7f-a43f1f29449b)
+
+Класс Memoizer3 уязвим, потому что составная операция «добавить, если отсутствует» выполняется на 
+резервном ассоциативном массиве, и ее нельзя сделать атомарной с помощью замка. Класс Memoizer 
+закрывает окно уязвимости атомарным методом putIfAbsent ассоциативного массива ConcurrentMap.
+
+Memoizer не решает задачу с истечением срока действия кэша, но он может обратиться к подклассу 
+FutureTask, который ассоциирует время истечения срока с каждым результатом и периодически проверяет 
+кэш на наличие данных с истекшим сроком. (Также Memoizer не решает проблему вытеснения кэша, при 
+котором старые записи удаляются для разгрузки памяти.)
+
+Окончательная реализация класса Memoizer
+
+```java
+public class Memoizer<A, V> implements Computable<A, V> {
+    private final ConcurrentMap<A, Future<V>> cache = new ConcurrentHashMap<A, Future<V>>();
+    private final Computable<A, V> c;
+    public Memoizer(Computable<A, V> c) {
+        this.c = c;
+    }
+    public V compute(final A arg) throws InterruptedException {
+        while (true) {
+            Future<V> f = cache.get(arg);
+            if (f == null) {
+                Callable<V> eval = new Callable<V>() {
+                    public V call() throws InterruptedException {
+                        return c.compute(arg);
+                    }
+                };
+                FutureTask<V> ft = new FutureTask<V>(eval);
+                f = cache.putIfAbsent(arg, ft);
+                if (f == null) {
+                    f = ft;
+                    ft.run();
+                }
+            }
+            try {
+                return f.get();
+            } catch (CancellationException e) {
+                cache.remove(arg, f);
+            } catch (ExecutionException e) {
+                throw launderThrowable(e.getCause());
+            }
+        }
+    }
+}
+```
+
+**Итоги**
+
+• Это мутируемое состояние, дурачок.
+Все вопросы конкурентности сводятся к координированию доступа к мутируемому состоянию. Чем менее 
+мутируемо состояние, тем легче обеспечить потокобезопасность.
+• Объявляйте поля финальными, если нет необходимости в том, чтобы они были мутируемыми.
+• Немутируемые объекты автоматически являются потокобезопасными.
+Немутируемые объекты упрощают конкурентное программирование. Они могут свободно использоваться без 
+блокировки или защитного копирования.
+• Инкапсуляция позволяет управлять сложностью.
+Можно написать потокобезопасную программу, в которой все данные хранятся в глобальных переменных, но 
+зачем? Инкапсулирование данных внутри объектов упрощает соблюдение их инвариантов, а инкапсулирование 
+синхронизации внутри объектов упрощает соблюдение их политики синхронизации.
+• Защищайте каждую мутируемую переменную с помощью замка.
+• Защищайте все переменные в инварианте с помощью одинаковых замков.
+• Удерживайте замки в течение всего времени составных действий. 
+• Программа, которая обращается к мутируемой переменной из многочисленных потоков без синхронизации, 
+неисправна.
+• Не верьте доводам, что обойдетесь без синхронизации.
+• Включайте потокобезопасность в процесс проектирования либо явным образом документируйте то, что 
+класс не является потокобезопасным.
+• Документируйте политику синхронизации.
 
 
