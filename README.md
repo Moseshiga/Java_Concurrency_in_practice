@@ -1998,6 +1998,128 @@ class TaskExecutionWebServer {
 мониторингу, журналированию, отчетности об ошибках и позволяет вносить другие дополнения, доступные 
 благодаря структуре выполнения задач.
 
+### 6.2.4. Жизненный цикл исполнителя Executor
+
+Исполнитель Executor отключается, когда все (не являющиеся демонами) потоки терминированы, после чего 
+следует выход JVM
+
+Задачами, предоставленными службе ExecutorService после ее выключения, занимается обработчик 
+отклоненного выполнения, который может отклонить задачу или вызвать метод execute для выдачи 
+непроверяемого исключения RejectedExecutionException. Как только все задачи завершены, служба 
+ExecutorService переходит в терминированное состояние. Обычно сразу за методом shutdown следует метод 
+awaitTermination, создающий эффект синхронного выключения службы ExecutorService.
+
+### 6.2.5. Отложенные и периодические задачи
+
+Механизм Timer управляет выполнением отложенных и периодических задач. Его альтернативой является 
+исполнитель ScheduledThreadPoolExecutor, который можно создать с помощью его собственного 
+конструктора либо фабричного метода newScheduledThreadPool.
+
+Чтобы построить свою службу планирования, воспользуйтесь очередью DelayQueue, предоставляющей 
+функциональные возможности планирования в исполнителе ScheduledThreadPoolExecutor. Она управляет 
+сбором отложенных объектов Delayed, каждый из которых имеет ассоциированное с ним время задержки: 
+очередь DelayQueue позволяет принимать элемент (метод take), только если его задержка истекла. 
+Объекты возвращаются из очереди DelayQueue, упорядоченной по времени, ассоциированному с их задержкой.
+
+## 6.3. Поиск эксплуатационно-пригодного параллелизма
+
+### 6.3.1. Пример: последовательный страничный  отрисовщик
+
+Последовательная обработка HTML-документа подразумевает при появлении текстовой разметки ее отрисовку 
+в буфере изображений, а при появлении ссылок на изображение — их доставку по сети и отрисовку в 
+буфере изображений. Такая обработка требует прикосновения к каждому входному элементу всего один раз, 
+но может занять много времени.
+
+Последовательная отрисовка элементов страницы
+
+```java
+public class SingleThreadRenderer {
+    void renderPage(CharSequence source) {
+        renderText(source);
+        List<ImageData> imageData = new ArrayList<ImageData>();
+        for (ImageInfo imageInfo : scanForImageInfo(source))
+            imageData.add(imageInfo.downloadImage());
+        for (ImageData data : imageData)
+            renderImage(data);
+    }
+}
+```
+
+### 6.3.2. Задачи, приносящие результаты: Callable и Future
+
+Для отложенных задач интерфейс Callable является более подходящей абстракцией: он ожидает, что 
+главная точка входа, call, вернет значение, и готов, если потребуется, выдать исключение. (Для того 
+чтобы с помощью Callable выразить задачу, не возвращающую значения, следует использовать 
+Callable<Void>).
+
+Интерфейс Future предоставляет методы, которые проверяют, была ли задача завершена или отменена, 
+извлекают ее результат и при необходимости отменяют ее.
+
+Интерфейсы Callable и Future
+
+```java
+public interface Callable<V> {
+    V call() throws Exception;
+}
+public interface Future<V> {
+    boolean cancel(boolean mayInterruptIfRunning);
+    boolean isCancelled();
+    boolean isDone();
+    V get() throws InterruptedException, ExecutionException,
+            CancellationException;
+    V get(long timeout, TimeUnit unit)
+            throws InterruptedException, ExecutionException,
+            CancellationException, TimeoutException;
+}
+```
+
+### 6.3.3. Пример: страничный отрисовщик с объектом Future
+
+В качестве первого шага к тому, чтобы сделать страничный отрисовщик более конкурентным, разделим его 
+на две подзадачи: отрисовку текста и скачивание изображений. (Поскольку одна задача в значительной 
+степени привязана к процессору, а другая — к вводу-выводу, этот подход может привести к улучшениям 
+даже в однопроцессорных системах.)
+
+```java
+public class FutureRenderer {
+    private final ExecutorService executor = ...;
+    void renderPage(CharSequence source) {
+        final List<ImageInfo> imageInfos = scanForImageInfo(source);
+        Callable<List<ImageData>> task =
+                new Callable<List<ImageData>>() {
+                    public List<ImageData> call() {
+                        List<ImageData> result
+                                = new ArrayList<ImageData>();
+                        for (ImageInfo imageInfo : imageInfos)
+                            result.add(imageInfo.downloadImage());
+                        return result;
+                    }
+                };
+        Future<List<ImageData>> future = executor.submit(task);
+        renderText(source);
+        try {
+            List<ImageData> imageData = future.get();
+            for (ImageData data : imageData)
+                renderImage(data);
+        } catch (InterruptedException e) {
+            // Переподтвердить статус прерванности потока
+            Thread.currentThread().interrupt();
+            // Нам не нужен результат, поэтому отменить задачу
+            future.cancel(true);
+        } catch (ExecutionException e) {
+            throw launderThrowable(e.getCause());
+        }
+    }
+}
+```
+
+Класс FutureRenderer позволяет отрисовывать текст конкурентно со скачиванием данных изображения. 
+Когда все изображения скачаны, они отрисовываются на странице. Пользователям нет необходимости ждать, 
+когда все изображения будут скачаны; они, скорее, предпочтут видеть изображения по мере их появления.
+
+
+
+
 
 
 
