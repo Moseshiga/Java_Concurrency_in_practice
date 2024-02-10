@@ -2117,14 +2117,546 @@ public class FutureRenderer {
 Когда все изображения скачаны, они отрисовываются на странице. Пользователям нет необходимости ждать, 
 когда все изображения будут скачаны; они, скорее, предпочтут видеть изображения по мере их появления.
 
+### 6.3.4. Ограничения параллелизации разнородных задач
 
+Проблема с разделением разнородных задач между многочисленными работниками заключается в том, что 
+задачи могут иметь несопоставимые размеры. Если вы разделите задачи A и B между двумя работниками, но 
+A будет занимать в десять раз больше времени, чем B, то вы ускорите суммарный процесс только на 9 %. 
+Наконец, для того чтобы разделение было оправданным, издержки на координацию должны компенсироваться 
+повышением производительности.
 
+Класс FutureRenderer использует две задачи: одну для отрисовки текста и одну для скачивания 
+изображений. Если отрисовка текста происходит намного быстрее, чем скачивание изображений, то 
+результирующая производительность не будет отличаться от полученной в последовательной версии, но код 
+будет намного сложнее. Существует предел количества дополнительной конкурентности, выигранной от 
+разделения задачи.
 
+Реальная отдача от разделения рабочей нагрузки программы на задачи достигается при наличии большого 
+числа независимых однородных задач, которые могут обрабатываться конкурентно.
 
+### 6.3.5. CompletionService: исполнитель Executor встречается с очередью BlockingQueue
 
+Если у вас есть пакет вычислений для предоставления исполнителю Executor и вы хотите извлекать их 
+результаты по мере появления существует оптимальный способ: служба завершения (CompletionService).
 
+Она сочетает в себе функциональность исполнителя Executor и блокирующей очереди BlockingQueue. Вы 
+можете предоставлять ей задачи Callable на выполнение и использовать методы take и poll.
 
+Реализация службы ExecutorCompletionService довольно проста. Конструктор создает очередь 
+BlockingQueue для хранения завершенных результатов. Класс FutureTask содержит метод done, который 
+вызывается по завершении вычислений. Когда задача предоставлена, она обертывается в QueueingFuture, 
+подкласс класса FutureTask, который переопределяет метод done, помещая результат в очередь 
+BlockingQueue.
 
+```java
+private class QueueingFuture<V> extends FutureTask<V> {
+    QueueingFuture(Callable<V> c) { super(c); }
+    QueueingFuture(Runnable t, V r) { super(t, r); }
+    protected void done() {
+        completionQueue.add(this);
+    }
+}
+```
 
+### 6.3.6. Пример: страничный отрисовщик со службой CompletionService
 
+Мы можем создать отдельную задачу для скачивания каждого изображения и его выполнения в пуле потоков, 
+превратив последовательное скачивание в параллельное: это сократит время скачивания всех изображений. 
+А путем доставки результатов из службы CompletionService и отрисовки каждого изображения, как только 
+оно будет в наличии, мы дадим пользователю динамичный и отзывчивый пользовательский интерфейс.
+
+Использование службы CompletionService для отрисовки страничных элементов по мере их доступности
+
+```java
+public class Renderer {
+    private final ExecutorService executor;
+    Renderer(ExecutorService executor) { this.executor = executor; }
+    void renderPage(CharSequence source) {
+        final List<ImageInfo> info = scanForImageInfo(source);
+        CompletionService<ImageData> completionService =
+                new ExecutorCompletionService<ImageData>(executor);
+        for (final ImageInfo imageInfo : info)
+            completionService.submit(new Callable<ImageData>() {
+                public ImageData call() {
+                    return imageInfo.downloadImage();
+                }
+            });
+        renderText(source);
+        try {
+            for (int t = 0, n = info.size(); t < n; t++) {
+                Future<ImageData> f = completionService.take();
+                ImageData imageData = f.get();
+                renderImage(imageData);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (ExecutionException e) {
+            throw launderThrowable(e.getCause());
+        }
+    }
+}
+```
+
+### 6.3.7. Наложение временных ограничений на задачи
+
+Иногда, если действие не завершается в течение определенного времени, то его результат становится 
+невостребованным. Например, веб-приложение может доставлять рекламные сообщения из внешнего сервера, 
+но если они там отсутствуют в течение двух секунд, оно выводит рекламное сообщение, принятое по 
+умолчанию, чтобы не снижать отзывчивость сайта
+
+Важно, чтобы хронометрированные задачи вычисляли результат, который не будет использоваться. Для 
+этого задачи управляются собственным бюджетом времени и прерываются, когда истекает время, либо 
+отменяются, когда истекает тайм-аут. Если хронометрированный метод get завершается с исключением 
+TimeoutException, то вы можете отменить задачу посредством объекта Future. Если задача написана как 
+отменяемая, то она может быть терминирована досрочно, для того чтобы не потреблять излишних ресурсов
+
+Получение рекламы с бюджетом времени
+
+```java
+Page renderPageWithAd() throws InterruptedException {
+    long endNanos = System.nanoTime() + TIME_BUDGET;
+    Future<Ad> f = exec.submit(new FetchAdTask());
+    // Отрисовать страницу в ожидании рекламы
+    Page page = renderPageBody();
+    Ad ad;
+    try {
+        // Ожидать только на протяжении оставшегося бюджета времени
+        long timeLeft = endNanos - System.nanoTime();
+        ad = f.get(timeLeft, NANOSECONDS);
+    } catch (ExecutionException e) {
+        ad = DEFAULT_AD;
+    } catch (TimeoutException e) {
+        ad = DEFAULT_AD;
+        f.cancel(true);
+    }
+    page.setAd(ad);
+    return page;
+}
+```
+
+### 6.3.8. Пример: портал бронирования поездок
+
+Рассмотрим программу, где пользователь вводит даты и требования, а портал доставляет и выводит 
+коммерческие предложения от ряда авиакомпаний, отелей и компаний по прокату автомобилей.
+
+Запрос цен на поездки в рамках бюджета времени
+
+```java
+private class QuoteTask implements Callable<TravelQuote> {
+    private final TravelCompany company;
+    private final TravelInfo travelInfo;
+    ...
+    public TravelQuote call() throws Exception {
+        return company.solicitQuote(travelInfo);
+    }
+}
+public List<TravelQuote> getRankedTravelQuotes(
+        TravelInfo travelInfo, Set<TravelCompany> companies,
+        Comparator<TravelQuote> ranking, long time, TimeUnit unit)
+        throws InterruptedException {
+    List<QuoteTask> tasks = new ArrayList<QuoteTask>();
+    for (TravelCompany company : companies)
+        tasks.add(new QuoteTask(company, travelInfo));
+    List<Future<TravelQuote>> futures = exec.invokeAll(tasks, time, unit);
+    List<TravelQuote> quotes = new ArrayList<TravelQuote>(tasks.size());
+    Iterator<QuoteTask> taskIter = tasks.iterator();
+    for (Future<TravelQuote> f : futures) {
+        QuoteTask task = taskIter.next();
+        try {
+            quotes.add(f.get());
+        } catch (ExecutionException e) {
+            quotes.add(task.getFailureQuote(e.getCause()));
+        } catch (CancellationException e) {
+            quotes.add(task.getTimeoutQuote(e));
+        }
+    }
+    Collections.sort(quotes, ranking);
+    return quotes;
+}
+```
+
+Тут используется хронометрированная версия метода invokeAll для предоставления многочисленных задач в 
+службу ExecutorService и получения результатов. Метод принимает коллекцию задач и возвращает 
+коллекцию объектов Future. Две коллекции имеют идентичные структуры; invokeAll добавляет объекты 
+Future в возвращаемую коллекцию в порядке, установленном итератором коллекции задач, позволяя 
+вызывающему элементу кода связать объект Future с объектом Callable, который он представляет. 
+Хронометрированная версия метода invokeAll возвратится после завершения всех задач, прерывания 
+вызывающего потока либо истечения тайм-аута. Все задачи, которые не были завершены по истечении тайм-
+аута, отменяются.
+
+**Итоги**
+
+Всякий раз, когда вы создаете потоки для выполнения задач, рассмотрите возможность использования
+исполнителя Executor.
+
+# 7 Отмена и выключение
+
+Java не предоставляет механизм для безопасной принудительной остановки работы потока, но 
+обеспечивает прерывание (interruption) — кооперативный механизм, который позволяет одному потоку 
+просить другой поток прекратить действовать.
+
+Кооперативный подход необходим, поскольку мы редко хотим, чтобы задача, поток или служба 
+останавливались немедленно, так как это может оставить совместные структуры данных в противоречивом 
+состоянии. Мы будем кодировать задачи и службы таким образом, чтобы при запросе они очищали любую 
+работу, которая в настоящий момент продолжается, а затем терминировали ее.
+
+В этой главе мы опишем механизмы отмены (cancellation) и прерывания и способы кодирования задач и 
+служб, откликающихся на запросы об отмене.
+
+## 7.1. Отмена задачи
+
+Действие доступно для отмены, если внешний код может направить его к остановке до момента его 
+нормального завершения в следующих случаях: 
+
+- Отмена по запросу пользователя. Пользователь нажал на кнопку «Отмена» в GUI-приложении или запросил
+  отмену через интерфейс управления, такой как JMX (Java Management Extensions). 
+- Ограниченное по времени действие. Приложение ведет поиск наилучшего решения в течение определенного
+  времени. По истечении срока все задачи в процессе поиска отменяются. 
+- События приложения. Приложение ищет лучшее решение, разбивая поиск на несколько задач, работающих в
+  разных участках пространства. Когда одна задача находит решение, все остальные задачи отменяются. 
+- Ошибки. Если задача веб-обходчика обнаруживает ошибку, другие задачи обхода отменяются, но остается
+  запись их текущего состояния для перезапуска. 
+- Выключение. При плавном выключении те задачи, которые в настоящий момент продолжаются, могут быть
+  доведены до завершения. В случае немедленного выключения задачи, которые в настоящий момент
+  выполняются, отменяются.
+
+Класс Prime - Generator, в котором простые числа выводятся до тех пор, пока действие не будет 
+отменено, иллюстрирует это техническое решение. Метод cancel устанавливает флажок cancelled, и 
+главный цикл опрашивает этот флажок перед поиском следующего простого числа. (Флажок cancelled должен 
+быть волатильным.)
+
+```java
+@ThreadSafe
+public class PrimeGenerator implements Runnable {
+    @GuardedBy("this")
+    private final List<BigInteger> primes = new ArrayList<BigInteger>();
+    private volatile boolean cancelled;
+    public void run() {
+        BigInteger p = BigInteger.ONE;
+        while (!cancelled) {
+            p = p.nextProbablePrime();
+            synchronized (this) {
+                primes.add(p);
+            }
+        }
+    }
+    public void cancel() { cancelled = true; }
+    public synchronized List<BigInteger> get() {
+        return new ArrayList<BigInteger>(primes);
+    }
+}
+```
+
+Задача, задуманная как отменяемая, должна иметь политику отмены, отвечающую на вопросы: как другой 
+код может запросить отмену, когда задача проверяет наличие запроса на отмену, какие действия задача 
+предпринимает в ответ на запрос об отмене.
+
+### 7.1.1. Прерывание
+
+Если задача, которая использует описанный выше подход, вызовет блокирующий метод, такой как 
+BlockingQueue.put, то она может ни разу не проверить флажок отмены и не терминироваться.
+
+В спецификации API или языка прерывание не привязано к какой-либо конкретной семантике отмены, но на 
+практике использование прерывания не для отмены является хрупким и трудно сопроводимым механизмом.
+
+Ненадежная отмена, которая может оставить производителей застрявшими в блокирующей операции. Так 
+делать не следует
+
+```java
+class BrokenPrimeProducer extends Thread {
+    private final BlockingQueue<BigInteger> queue;
+    private volatile boolean cancelled = false;
+    BrokenPrimeProducer(BlockingQueue<BigInteger> queue) {
+        this.queue = queue;
+    }
+    public void run() {
+        try {
+            BigInteger p = BigInteger.ONE;
+            while (!cancelled)
+                queue.put(p = p.nextProbablePrime());
+        } catch (InterruptedException consumed) { }
+    }
+    public void cancel() { cancelled = true; }
+}
+void consumePrimes() throws InterruptedException {
+    BlockingQueue<BigInteger> primes = ...;
+    BrokenPrimeProducer producer = new BrokenPrimeProducer(primes);
+    producer.start();
+    try {
+        while (needMorePrimes())
+            consume(primes.take());
+    } finally {
+        producer.cancel();
+    }
+}
+```
+
+Каждый поток имеет булев статус прерванности (interrupted status): true или false. Объект Thread 
+содержит метод interrupt, прерывающий целевой поток, и метод isInterrupted, возвращающий потоку 
+статус прерванности. Очистить статус прерванности можно только статическим методом interrupted.
+
+Блокирующие библиотечные методы, такие как Thread.sleep и Object. wait, быстро отзываются на 
+прерывание, очищая статус прерванности и выдавая исключение InterruptedException.
+
+Методы прерывания в классе Thread
+
+```java
+public class Thread {
+    public void interrupt() { ... }
+    public boolean isInterrupted() { ... }
+    public static boolean interrupted() { ... }
+    ...
+}
+```
+
+Вызов метода interrupt не обязательно побуждает целевой поток прекратить действия — он только 
+доставляет сообщение о том, что прерывание было запрошено.
+
+Прерывание обычно является наиболее разумным способом реализации отмены.
+
+Использование прерывания для отмены
+
+```java
+class PrimeProducer extends Thread {
+    private final BlockingQueue<BigInteger> queue;
+    PrimeProducer(BlockingQueue<BigInteger> queue) {
+        this.queue = queue;
+    }
+    public void run() {
+        try {
+            BigInteger p = BigInteger.ONE;
+            while (!Thread.currentThread().isInterrupted())
+                queue.put(p = p.nextProbablePrime());
+        } catch (InterruptedException consumed) {
+            /* Разрешить потоку выйти */
+        }
+    }
+    public void cancel() { interrupt(); }
+}
+```
+
+### 7.1.2. Политики прерывания
+
+Задачи не выполняются в потоках, которыми они владеют, — они заимствуют потоки, принадлежащие службе, 
+такой как пул потоков. Код, который не является владельцем потока (любой код вне реализации пула), 
+должен следить за сохранением статуса прерванности, чтобы владеющий код мог предпринять по нему какие-
+либо действия.
+
+Вот почему большинство блокирующих библиотечных методов в ответ на прерывание выдают исключение 
+InterruptedException. Они не выполняются в потоке, которым владеют, а сообщают о находке вызывающему 
+элементу кода.
+
+Если задача не может распространить исключение InterruptedException на вызывающий ее элемент кода, то 
+она должна восстановить статус прерванности после отлова исключения InterruptedException:
+*Thread.currentThread().interrupt();*
+
+Не прерывайте поток, если не знаете, как он интерпретирует прерывание.
+
+### 7.1.3. Отклик на прерывание
+
+Существуют две практические стратегии для обработки исключения InterruptedException:
+- распространение исключения (возможно, после очистки, специфичной для задачи), после которого метод
+  станет прерываемым и блокирующим;
+- восстановление статуса прерванности, чтобы код выше в стеке вызовов мог с ним работать.
+
+Распространение исключения InterruptedException сравнимо по простоте с его добавлением в спецификатор 
+throws.
+
+Распространение исключения InterruptedException на вызывающие элементы кода
+
+```java
+BlockingQueue<Task> queue;
+...
+public Task getNextTask() throws InterruptedException {
+    return queue.take();
+}
+```
+
+Если вы не хотите или не можете распространить исключение InterruptedException (возможно, потому, что 
+ваша задача определяется интерфейсом Runnable), то сохраните запрос на прерывание через 
+восстановление статуса прерванности путем повторного вызова метода interrupt. Не следует проглатывать 
+исключение, если ваш код не реализует политику прерывания для потока. Класс PrimeProducer 
+проглатывает прерывание, но лишь потому, что поток вот-вот терминируется и в стеке вызовов выше нет 
+кода, который должен знать о прерывании.
+
+Проглатывание запроса на прерывание разрешено только коду, реализующему политику прерывания потока.
+
+Неотменяемая задача, восстанавливающая прерывание перед выходом
+
+```java
+public Task getNextTask(BlockingQueue<Task> queue) {
+    boolean interrupted = false;
+    try {
+        while (true) {
+            try {
+                return queue.take();
+            } catch (InterruptedException e) {
+                interrupted = true;
+                // проскочить и попытаться снова
+            }
+        }
+    } finally {
+        if (interrupted)
+            Thread.currentThread().interrupt();
+    }
+}
+```
+
+Когда рабочий поток, принадлежащий исполнителю ThreadPoolExecutor, обнаруживает прерывание, он 
+проверяет, выключается ли пул в данный момент. Если это так, то он выполняет очистку пула перед его 
+терминированием. В противном случае он может создать новый поток для восстановления пула до нужного 
+размера
+
+### 7.1.4. Пример: хронометрированный прогон
+
+Ниже объект Runnable запускает задачу в вызывающем потоке и планирует вторую задачу, которая отменит 
+первую после заданного интервала времени. Данный пример нарушает правило: прежде чем прерывать поток, 
+узнать его политику прерывания. Метод timedRun вызывается из произвольного потока, и если первая 
+задача завершится до истечения тайм-аута, то задача отмены может начать действовать после возвращения 
+метода к вызвавшему его элементу кода. Чтобы устранить риск нежелательного результата, нужно 
+использовать объект ScheduledFuture, возвращаемый методом schedule, чтобы отменить задачу отмены.
+
+Планирование прерывания на заимствованном потоке. Так делать не следует
+
+```java
+private static final ScheduledExecutorService cancelExec = ...;
+public static void timedRun(Runnable r, long timeout, TimeUnit unit) {
+    final Thread taskThread = Thread.currentThread();
+    cancelExec.schedule(new Runnable() {
+        public void run() { taskThread.interrupt(); }
+    }, timeout, unit);
+    r.run();
+}
+```
+
+Прерывание задачи в выделенном потоке
+
+```java
+public static void timedRun(final Runnable r, long timeout, TimeUnit unit)
+        throws InterruptedException {
+    class RethrowableTask implements Runnable {
+        private volatile Throwable t;
+        public void run() {
+            try { r.run(); }
+            catch (Throwable t) { this.t = t; }
+        }
+        void rethrow() {
+            if (t != null)
+                throw launderThrowable(t);
+        }
+    }
+    RethrowableTask task = new RethrowableTask();
+    final Thread taskThread = new Thread(task);
+    taskThread.start();
+    cancelExec.schedule(new Runnable() {
+        public void run() { taskThread.interrupt(); }
+    }, timeout, unit);
+    taskThread.join(unit.toMillis(timeout));
+    task.rethrow();
+}
+```
+
+После запуска задачного потока метод timedRun выполняет хронометрированный метод присоединения join с 
+только что созданным потоком. После своего возвращения метод join проверяет, выдала ли задача 
+исключение, и если да, то повторно выдает его в потоке, вызывающем метод timedRun. Сохраненный объект 
+Throwable используется двумя потоками, и поэтому объявляется волатильным с целью его безопасной 
+публикации из задачного потока в поток метода timedRun. Мы устранили проблемы, описанные в предыдущих 
+примерах, но пока не знаем, возвращено ли управление и истек ли тайм-аут метода join.
+
+thread join: https://www.baeldung.com/java-thread-join
+
+### 7.1.5. Отмена с помощью Future
+
+Объект Future содержит метод cancel, который принимает булев аргумент mayInterruptIfRunning и 
+возвращает значение, указывающее на успешность или неуспешность попытки отмены. (Оно сообщает о 
+доставке прерывания, а не об обнаружении задачи или каких-то действиях по прерыванию.) Аргумент, равный 
+true, сообщает о прерывании потока, в котором работает задача. Когда можно вызывать метод cancel с 
+аргументом true? Можно безопасно устанавливать аргумент mayInterruptIfRunning при отмене задач, 
+работающих в стандартном исполнителе Executor. Не следует прерывать принадлежащий пулу поток 
+непосредственно при попытке отменить задачу, так как вы не будете знать, какая задача работает во время 
+доставки запроса на прерывание: делайте это только через объект Future задачи. Кодируя задачи так, 
+чтобы они рассматривали прерывание как запрос на отмену, вы обеспечиваете возможность их отмены через 
+Future.
+
+Отмена задачи с помощью Future
+
+```java
+public static void timedRun(Runnable r, long timeout, TimeUnit unit) throws InterruptedException {
+    Future<?> task = taskExec.submit(r);
+    try {
+        task.get(timeout, unit);
+    } catch (TimeoutException e) {
+        // задача будет отменена ниже
+    } catch (ExecutionException e) {
+        // исключение выдано в задаче; выдать повторно
+        throw launderThrowable(e.getCause());
+    } finally {
+        // Безвредно, если задача уже завершена
+        task.cancel(true); // прервать, если работает
+    }
+}
+```
+
+Когда метод Future.get выдает исключение InterruptedException (или TimeoutException), и вы знаете, что 
+результат больше не нужен, то отмените задачу с помощью метода Future.cancel.
+
+### 7.1.6. Работа с непрерываемым блокированием
+
+Прерывание потока, заблокированного во время выполнения синхронного сокетного ввода-вывода или ожидания 
+приобретения внутреннего замка, не состоится (будет только установлен статус прерванности потока). 
+Чтобы убедить поток, блокированный в непрерываемом действии, остановиться с помощью средств, подобных 
+прерыванию, нужно понимать механизм его блокирования.
+
+- Синхронный сокетный ввод‑вывод в java.io. Распространенной формой блокирующего ввода-вывода в
+  серверных приложениях является чтение из сокета или запись в сокет. К сожалению, методы чтения и
+  записи в InputStream и OutputStream не отзываются на прерывание, но закрытие базового сокета
+  побуждает любые потоки, блокированные в методах read или write, выдавать исключение SocketException. 
+- Синхронный ввод‑вывод в java.nio. Прерывание потока, ожидающего на канале InterruptibleChannel,
+  побуждает все потоки, блокированные на этом канале, выдавать исключение ClosedByInterruptException и
+  закрывать канал. Закрытие канала InterruptibleChannel побуждает потоки, блокированные на канальных
+  операциях, выдавать исключение AsynchronousCloseException. 
+- Асинхронный ввод‑вывод с помощью Selector. Если поток заблокирован в методе Selector.select (в
+  ava.nio.channels), то метод wakeup побуждает его возвращаться досрочно с исключением
+  ClosedSelectorException. 
+- Приобретение замка. Нельзя остановить поток, заблокированный во время ожидания внутреннего замка. Но
+  можно помочь ему приобрести замок и продвинуться. А явные замковые классы Lock предлагают метод
+  lockInterruptibly, который позволяет ожидать замок и при этом отзываться на прерывания (см. главу 13).
+
+Сокрытие нестандартной отмены в потоке Thread путем переопределения метода interrupt
+
+```java
+public class ReaderThread extends Thread {
+    private final Socket socket;
+    private final InputStream in;
+    public ReaderThread(Socket socket) throws IOException {
+        this.socket = socket;
+        this.in = socket.getInputStream();
+    }
+    public void interrupt() {
+        try {
+            socket.close();
+        }
+        catch (IOException ignored) { }
+        finally {
+            super.interrupt();
+        }
+    }
+    public void run() {
+        try {
+            byte[] buf = new byte[BUFSZ];
+            while (true) {
+                int count = in.read(buf);
+                if (count < 0)
+                    break;
+                else if (count > 0)
+                    processBuffer(buf, count);
+            }
+        } catch (IOException e) { /* Позволяет выход потока */ }
+    }
+}
+```
+
+## 7.2. Остановка поточной службы
+
+Инкапсуляция нестандартной отмены в задаче с помощью метода newTaskFor
 
