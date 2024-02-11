@@ -2658,5 +2658,145 @@ public class ReaderThread extends Thread {
 
 ## 7.2. Остановка поточной службы
 
+Приложения обычно создают службы, которые владеют потоками, такие как пулы потоков, и время 
+существования этих служб обычно превышает время существования метода, который их создает. Если 
+приложение планируется выключить плавно, то потоки, находящиеся во владении этих служб, должны быть 
+терминированы: их нужно убедить выключиться самостоятельно.
+
 Инкапсуляция нестандартной отмены в задаче с помощью метода newTaskFor
+
+```java
+public interface CancellableTask<T> extends Callable<T> {
+    void cancel();
+    RunnableFuture<T> newTask();
+}
+@ThreadSafe
+public class CancellingExecutor extends ThreadPoolExecutor {
+ ...
+    protected<T> RunnableFuture<T> newTaskFor(Callable<T> callable) {
+        if (callable instanceof CancellableTask)
+            return ((CancellableTask<T>) callable).newTask();
+        else
+            return super.newTaskFor(callable);
+    }
+}
+public abstract class SocketUsingTask<T> implements CancellableTask<T> {
+    @GuardedBy("this") private Socket socket;
+    protected synchronized void setSocket(Socket s) { socket = s; }
+    public synchronized void cancel() {
+        try {
+
+            if (socket != null)
+                socket.close();
+        } catch (IOException ignored) { }
+    }
+    public RunnableFuture<T> newTask() {
+        return new FutureTask<T>(this) {
+            public boolean cancel(boolean mayInterruptIfRunning) {
+                try {
+                    SocketUsingTask.this.cancel();
+                } finally {
+                    return super.cancel(mayInterruptIfRunning);
+                }
+            }
+        };
+    }
+}
+```
+
+Приложение может владеть службой, а служба — рабочими потоками, но приложение не владеет рабочими 
+потоками и не должно пытаться останавливать их напрямую. Вместо этого служба должна предоставлять 
+методы жизненного цикла для самовыключения, которые также выключат принадлежащие ей потоки. Например, 
+служба ExecutorService предоставляет методы shutdown и shutdownNow
+
+Предоставляйте методы жизненного цикла, если владеющая потоком служба должна жить дольше метода, 
+который ее создал.
+
+### 7.2.1. Пример: служба журналирования
+
+Служба журналирования «производитель-потребитель» без поддержки выключения
+
+```java
+public class LogWriter {
+    private final BlockingQueue<String> queue;
+    private final LoggerThread logger;
+    public LogWriter(Writer writer) {
+        this.queue = new LinkedBlockingQueue<String>(CAPACITY);
+        this.logger = new LoggerThread(writer);
+    }
+    public void start() { logger.start(); }
+    public void log(String msg) throws InterruptedException {
+        queue.put(msg);
+    }
+    private class LoggerThread extends Thread {
+        private final PrintWriter writer;
+        ...
+        public void run() {
+            try {
+                while (true)
+                    writer.println(queue.take());
+            } catch(InterruptedException ignored) {
+            } finally {
+                writer.close();
+            }
+        }
+    }
+}
+```
+
+Помните, что внезапное выключение выбрасывает журнальные сообщения, ожидающие запись, а 
+заблокированные в методе log потоки никогда не будут разблокированы. Отмена в шаблоне подразумевает 
+отмену как производителей, так и потребителей, но первых отменить сложнее, так как они не являются 
+выделенными потоками.
+
+Добавление надежной отмены в LogWriter
+
+```java
+public class LogService {
+    private final BlockingQueue<String> queue;
+    private final LoggerThread loggerThread;
+    private final PrintWriter writer;
+    @GuardedBy("this") private boolean isShutdown;
+    @GuardedBy("this") private int reservations;
+    public void start() { loggerThread.start(); }
+    public void stop() {
+        synchronized (this) { isShutdown = true; }
+        loggerThread.interrupt();
+    }
+    public void log(String msg) throws InterruptedException {
+        synchronized (this) {
+            if (isShutdown)
+                throw new IllegalStateException(...);
+            ++reservations;
+        }
+        queue.put(msg);
+    }
+    private class LoggerThread extends Thread {
+        public void run() {
+            try {
+                while (true) {
+                    try {
+                        synchronized (this) {
+                            if (isShutdown && reservations == 0)
+                                break;
+                        }
+                        String msg = queue.take();
+                        synchronized (this) { --reservations; }
+                        writer.println(msg);
+                    } catch (InterruptedException e) { /* повторная попытка */ }
+                }
+            } finally {
+                writer.close();
+            }
+        }
+    }
+}
+```
+
+Наличие замка заставит метод put блокировать продвижение, поэтому мы будем «резервировать» право 
+отправлять сообщение с помощью условного приращения счетчика, атомарно проверяя выключение
+
+### 7.2.2. Выключение службы ExecutorService
+
+
 
