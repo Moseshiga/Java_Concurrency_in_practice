@@ -2798,5 +2798,220 @@ public class LogService {
 
 ### 7.2.2. Выключение службы ExecutorService
 
+Служба журналирования, использующая ExecutorService
+
+```java
+public class LogService {
+    private final ExecutorService exec = newSingleThreadExecutor();
+    ...
+    public void start() { }
+    public void stop() throws InterruptedException {
+        try {
+            exec.shutdown();
+            exec.awaitTermination(TIMEOUT, UNIT);
+        } finally {
+            writer.close();
+        }
+    }
+    public void log(String msg) {
+        try {
+            exec.execute(new WriteTask(msg));
+        } catch (RejectedExecutionException ignored) { }
+    }
+}
+```
+
+### 7.2.3. Ядовитые таблетки
+
+Еще один способ убедить службу «производитель-потребитель» выключиться представлен ядовитой 
+таблеткой (poison pill) — узнаваемым объектом очереди, получатель которого останавливается. При 
+FIFO ядовитая таблетка заставляет потребителей закончить начатое, так как производители не смогут 
+предоставлять работу после ее помещения в очередь.
+
+Ядовитые таблетки надежно работают с известным числом производителей и потребителей и 
+неограниченными очередями. В службе IndexingService можно увеличить число производителей и 
+потребителей, размещая достаточное число таблеток.
+
+Выключение с ядовитой таблеткой
+
+```java
+public class IndexingService {
+    private static final File POISON = new File("");
+    private final IndexerThread consumer = new IndexerThread();
+    private final CrawlerThread producer = new CrawlerThread();
+    private final BlockingQueue<File> queue;
+    private final FileFilter fileFilter;
+    private final File root;
+    public class CrawlerThread extends Thread {
+        public void run() {
+            try {
+                crawl(root);
+            } catch (InterruptedException e) { /* проскочить */ }
+            finally {
+                while (true) {
+                    try {
+                        queue.put(POISON);
+                        break;
+                    } catch (InterruptedException e1) { /* попытаться снова */ }
+                }
+            }
+        }
+        private void crawl(File root) throws InterruptedException {
+ ...
+        }
+    }
+    public class IndexerThread extends Thread {
+        public void run() {
+            try {
+                while (true) {
+                    File file = queue.take();
+                    if (file == POISON)
+                        break;
+                    else
+                        indexFile(file);
+                }
+            } catch (InterruptedException consumed) { }
+        }
+    }
+    public void start() {
+        producer.start();
+        consumer.start();
+    }
+    public void stop() { producer.interrupt(); }
+    public void awaitTermination() throws InterruptedException {
+        consumer.join();
+    }
+}
+```
+
+### 7.2.4. Пример: служба однократного выполнения
+
+Использование приватного исполнителя Executor, время жизни которого ограничено вызовом метода
+
+```java
+boolean checkMail(Set<String> hosts, long timeout, TimeUnit unit)
+            throws InterruptedException {
+        ExecutorService exec = Executors.newCachedThreadPool();
+        final AtomicBoolean hasNewMail = new AtomicBoolean(false);
+        try {
+            for (final String host : hosts)
+                exec.execute(new Runnable() {
+                    public void run() {
+                        if (checkMail(host))
+                            hasNewMail.set(true);
+                    }
+                });
+        } finally {
+            exec.shutdown();
+            exec.awaitTermination(timeout, unit);
+        }
+        return hasNewMail.get();
+}
+```
+
+### 7.2.5. Ограничения метода shutdownNow
+
+
+
+Служба ExecutorService, отслеживающая отмененные задачи после выключения
+
+Нет способа узнать о состоянии задач, находившихся в процессе работы во время выключения, если сами 
+задачи не занимаются установкой своего рода контрольных точек. Для того чтобы узнать, какие задачи 
+не были завершены, вам нужно знать, не только какие задачи не были запущены, но и какие задачи 
+находились в процессе работы, когда исполнитель быть выключен. 
+
+Класс TrackingExecutor предоставляет решение для нахождения задач, выполняемых во время выключения. 
+Инкапсулируя службу ExecutorService и запоминая методом execute (или submit) задачи, отмененные 
+после выключения, исполнитель TrackingExecutor идентифицирует, какие задачи были запущены, но не 
+завершались корректно. После завершения работы исполнителя метод getCancelledTasks возвращает 
+список отмененных задач. Задачи должны сохранять статус прерванности потока при возвращении
+
+```java
+public class TrackingExecutor extends AbstractExecutorService {
+    private final ExecutorService exec;
+    private final Set<Runnable> tasksCancelledAtShutdown =
+            Collections.synchronizedSet(new HashSet<Runnable>());
+    ...
+    public List<Runnable> getCancelledTasks() {
+        if (!exec.isTerminated())
+            throw new IllegalStateException(...);
+        return new ArrayList<Runnable>(tasksCancelledAtShutdown);
+    }
+    public void execute(final Runnable runnable) {
+        exec.execute(new Runnable() {
+            public void run() {
+                try {
+                    runnable.run();
+                } finally {
+                    if (isShutdown()
+                            && Thread.currentThread().isInterrupted())
+                        tasksCancelledAtShutdown.add(runnable);
+                }
+            }
+        });
+    }
+    // делегировать другие методы службы ExecutorService исполнителю
+}
+```
+
+Исполнитель TrackingExecutor содержит состояние гонки, которое допускает идентификацию завешенных 
+задач как отмененных. Пул потоков может быть выключен между моментом выполнения последней 
+инструкции задачи и моментом записи завершения задачи. Задачи обходчика идемпотентны (их двукратное 
+выполнение имеет тот же эффект, что и однократное). В других случаях будьте готовы к работе с 
+ложными утверждениями.
+
+Использование TrackingExecutorService для сохранения незаконченных задач для последующего выполнения
+
+```java
+public abstract class WebCrawler {
+    private volatile TrackingExecutor exec;
+    @GuardedBy("this")
+    private final Set<URL> urlsToCrawl = new HashSet<URL>();
+    ...
+    public synchronized void start() {
+        exec = new TrackingExecutor(
+                Executors.newCachedThreadPool());
+        for (URL url : urlsToCrawl) submitCrawlTask(url);
+        urlsToCrawl.clear();
+    }
+    public synchronized void stop() throws InterruptedException {
+        try {
+            saveUncrawled(exec.shutdownNow());
+            if (exec.awaitTermination(TIMEOUT, UNIT))
+                saveUncrawled(exec.getCancelledTasks());
+        } finally {
+            exec = null;
+        }
+    }
+
+    protected abstract List<URL> processPage(URL url);
+    private void saveUncrawled(List<Runnable> uncrawled) {
+        for (Runnable task : uncrawled)
+            urlsToCrawl.add(((CrawlTask) task).getPage());
+    }
+    private void submitCrawlTask(URL u) {
+        exec.execute(new CrawlTask(u));
+    }
+    private class CrawlTask implements Runnable {
+        private final URL url;  
+        ...
+        public void run() {
+            for (URL link : processPage(url)) {
+                if (Thread.currentThread().isInterrupted())
+                    return;
+                submitCrawlTask(link);
+            }
+        }
+        public URL getPage() { return url; }
+    }
+}
+```
+
+## 7.3. Обработка аномальной терминации потоков
+
+
+
+
+
 
 
