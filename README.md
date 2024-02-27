@@ -3219,9 +3219,254 @@ public ThreadPoolExecutor(int corePoolSize,
 
 ### 8.3.2. Управление задачами очереди
 
+Исполнитель ThreadPoolExecutor позволяет предоставить очередь BlockingQueue для хранения задач, 
+ожидающих выполнения. Существует три основных подхода к организации очередности задач: неограниченная 
+очередь, ограниченная очередь и синхронная эстафетная передача. Выбор очереди взаимодействует с другими 
+параметрами конфигурации, такими как размер пула.
 
+По умолчанию для newFixedThreadPool и newSingleThreadExecutor используется неограниченная очередь 
+LinkedBlockingQueue. Задачи помещаются в очередь, если все рабочие потоки заняты, но очередь может расти 
+неограниченно, если задачи продолжают поступать быстрее, чем они могут быть выполнены.
 
+Более стабильной стратегией управления ресурсами является использование ограниченной очереди, такой как 
+ArrayBlockingQueue, LinkedBlockingQueue или PriorityBlockingQueue. Она помогает предотвратить исчерпание 
+ресурсов, но ставит вопрос о том, что делать с новыми задачами, когда очередь заполнена. Размер 
+ограниченной рабочей очереди и размер пула должны соответствовать друг другу
 
+Очередь SynchronousQueue является механизмом управления эстафетной передачей между потоками. Элемент 
+помещается в SynchronousQueue с помощью ожидающего его потока. Если ни один поток не ожидает, но текущий 
+размер пула меньше максимума, то исполнитель ThreadPoolExecutor создает новый поток либо задача 
+отклоняется согласно политике насыщения. Благодаря прямой эстафетной передаче задача может быть передана 
+непосредственно выполняющему потоку, минуя очередь. SynchronousQueue полезна, если пул неограничен или 
+допустимо отклонение избыточных задач. Фабрика newCachedThreadPool использует этот тип очереди.
 
+Фабрика newCachedThreadPool является хорошим выбором для исполнителя Executor, так как обеспечивает 
+более высокую производительность очереди, чем фиксированный пул потоков1 , который, в свою очередь, 
+уместен при ограниченном числе конкурентных задач.
 
+### 8.3.3. Политика насыщения
+
+Когда ограниченная рабочая очередь заполнена, в игру вступает политика насыщения. Для исполнителя 
+ThreadPoolExecutor она может быть изменена путем вызова обработчика setRejectedExecutionHandler. 
+(Политика насыщения также используется, когда задача передается исполнителю Executor, который был 
+выключен.) Есть несколько реализаций обработчика RejectedExecutionHandler, поддерживающих разные 
+политики насыщения: AbortPolicy, CallerRunsPolicy, DiscardPolicy и DiscardOldestPolicy. 
+
+По умолчанию применяется политика абортирования (abort), при которой метод execute выдает непроверяемое 
+исключение RejectedExecutionException. Вызывающий элемент кода может отловить это исключение и 
+реализовать обработку переполнения по своему усмотрению. Политика отбрасывания (discard) молчаливо 
+отбрасывает только что предоставленную задачу, если ее нельзя поставить в очередь на выполнение. 
+Политика отбрасывания самой старой задачи (discard-oldest) отбрасывает задачу, которая в иных случаях 
+была бы выполнена позднее, и пытается повторно предоставить новую задачу. (Если рабочая очередь имеет 
+приоритеты, то отбрасывается элемент с наивысшим приоритетом, что противоречит функциям очереди.)
+
+Политика под управлением вызывающего элемента кода (caller-runs policy) старается замедлить поток новых 
+задач, направляя некоторую работу назад вызывающему элементу кода. Она выполняет только что 
+предоставленную задачу не в пуле, а в потоке, который вызывает метод execute. Если бы мы изменяли пример 
+WebServer так, чтобы он использовал ограниченную очередь и политику под управлением вызывающего элемента 
+кода, то в конце концов все потоки пула были бы заняты, и рабочая очередь, заполненная до конца 
+следующей задачей, выполнялась бы во время вызова метода execute в главном потоке. Некоторое время 
+главный поток не смог бы предоставлять задачи, давая рабочим потокам шанс нивелировать отставание, и не 
+вызвал бы метод accept в это время. Поэтому входящие запросы стали бы накапливаться в очереди на уровне 
+TCP, а не в приложении. При длительной перегрузке TCP тоже начал бы отбрасывать запросы, на этот раз — 
+клиенту и с более плавной деградацией.
+
+Создание пула потоков фиксированного размера с ограниченной очередью и политикой насыщения под 
+управлением вызывающего элемента кода
+
+```java
+ThreadPoolExecutor executor = new ThreadPoolExecutor(N_THREADS, N_THREADS, 0L, TimeUnit.MILLISECONDS,
+    new LinkedBlockingQueue<Runnable>(CAPACITY));
+executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+```
+
+### 8.3.4. Фабрики потоков
+
+Пул создает потоки посредством фабрики потоков, которая по умолчанию создает поток, не являющийся 
+демоном, без специальной конфигурации. Кастомизация фабрики потоков позволяет настроить конфигурацию 
+потоков пула. Фабрика ThreadFactory имеет единственный метод, newThread, который вызывается всякий раз, 
+когда пулу необходимо создать новый поток.
+
+Интерфейс ThreadFactory
+
+```java
+public interface ThreadFactory {
+    Thread newThread(Runnable r);
+}
+```
+
+Настраиваемая фабрика потоков
+
+```java
+public class MyThreadFactory implements ThreadFactory {
+    private final String poolName;
+    public MyThreadFactory(String poolName) {
+        this.poolName = poolName;
+    }
+    public Thread newThread(Runnable runnable) {
+        return new MyAppThread(runnable, poolName);
+    }
+}
+```
+
+Базовый класс настраиваемого потока
+
+```java
+public class MyAppThread extends Thread {
+    public static final String DEFAULT_NAME = "MyAppThread";
+    private static volatile boolean debugLifecycle = false;
+    private static final AtomicInteger created = new AtomicInteger();
+    private static final AtomicInteger alive = new AtomicInteger();
+    private static final Logger log = Logger.getAnonymousLogger();
+    public MyAppThread(Runnable r) { this(r, DEFAULT_NAME); }
+    public MyAppThread(Runnable runnable, String name) {
+        super(runnable, name + "-" + created.incrementAndGet());
+        setUncaughtExceptionHandler(new Thread.UncaughtExceptionHandler() {
+            public void uncaughtException(Thread t,Throwable e) {
+                log.log(Level.SEVERE, "НЕ ОТЛОВЛЕН в потоке " + t.getName(), e);
+            }
+        });
+    }
+    public void run() {
+        // Отладочный флажок копирования для повсеместного
+        // обеспечения непротиворечивого значения.
+        boolean debug = debugLifecycle;
+        if (debug) log.log(Level.FINE, "Создан "+getName());
+        try {
+            alive.incrementAndGet();
+            super.run();
+        } finally {
+            alive.decrementAndGet();
+            if (debug) log.log(Level.FINE, "Завершаю "+getName());
+        }
+    }
+    public static int getThreadsCreated() { return created.get(); }
+    public static int getThreadsAlive() { return alive.get(); }
+    public static boolean getDebug() { return debugLifecycle; }
+    public static void setDebug(boolean b) { debugLifecycle = b; }
+}
+```
+
+(???) Если ваше приложение пользуется преимуществом политик безопасности, используйте фабричный метод
+privilegedThreadFactory в исполнителях для создания фабрики потоков. Он создает потоки в пуле, которые
+имеют те же разрешения, AccessControlContext и contextClassLoader, что и поток, создающий фабрику
+privilegedThreadFactory. Помните, что потоки, созданные пулом, наследуют разрешения от любого клиента,
+который будет вызывать методы execute или submit, что может привести к исключениям, связанным с
+безопасностью.
+
+### 8.3.5. Настройка класса ThreadPoolExecutor после конструирования
+
+Большинство параметров, передаваемых конструкторам класса ThreadPoolExecutor, могут быть изменены после 
+конструирования посредством методов доступа set. Если Executor создается с помощью одного из фабричных 
+методов в классах Executor (кроме класса newSingleThreadExecutor), то для обращения к методам доступа set
+вы можете привести результат к типу ThreadPoolExecutor.
+
+Изменение исполнителя, созданного с помощью стандартных фабрик
+
+```java
+ExecutorService exec = Executors.newCachedThreadPool();
+if (exec instanceof ThreadPoolExecutor)
+    ((ThreadPoolExecutor) exec).setCorePoolSize(10);
+else
+    throw new AssertionError("Опаньки! Плохое допущение");
+```
+
+## 8.4. Расширение класса ThreadPoolExecutor
+
+Класс ThreadPoolExecutor был спроектирован для расширения с помощью перехватчиков — методов 
+beforeExecute, afterExecute и terminate. Перехватчики beforeExecute и afterExecute вызываются в потоке, 
+выполняющем задачу, и используются для добавления журналирования, хронометрирования, мониторинга или 
+сбора статистики. Перехватчик afterExecute вызывается независимо от того, как задача завершается: 
+возвращаясь из метода run нормальным образом либо выдавая исключение.  Если перехватчик beforeExecute 
+выдает исключение RuntimeException, то задачи не выполняются, и перехватчик afterExecute не вызывается.
+
+Перехватчик terminated вызывается, когда пул потоков завершает процесс выключения. Он может 
+использоваться для высвобождения ресурсов, выполнения уведомлений или журналирования, а также 
+финализирования сбора статистики
+
+### 8.4.1. Пример: добавление статистики в пул потоков
+
+Пул потоков, расширенный журналированием и хронометрированием
+
+```java
+public class TimingThreadPool extends ThreadPoolExecutor {
+    private final ThreadLocal<Long> startTime = new ThreadLocal<Long>();
+    private final Logger log = Logger.getLogger("TimingThreadPool");
+    private final AtomicLong numTasks = new AtomicLong();
+    private final AtomicLong totalTime = new AtomicLong();
+    protected void beforeExecute(Thread t, Runnable r) {
+        super.beforeExecute(t, r);
+        log.fine(String.format("Поток %s: начало %s", t, r));
+        startTime.set(System.nanoTime());
+    }
+    protected void afterExecute(Runnable r, Throwable t) {
+        try {
+            long endTime = System.nanoTime();
+            long taskTime = endTime - startTime.get();
+            numTasks.incrementAndGet();
+            totalTime.addAndGet(taskTime);
+            log.fine(String.format("Поток %s: конец %s, время=%dns",
+                    t, r, taskTime));
+        } finally {
+            super.afterExecute(r, t);
+        }
+    }
+    protected void terminated() {
+        try {
+            log.info(String.format("Terminated: avg time=%dns",
+                    totalTime.get() / numTasks.get()));
+        } finally {
+            super.terminated();
+        }
+    }
+}
+```
+
+## 8.5. Параллелизация рекурсивных алгоритмов
+
+Преобразование последовательной хвостовой рекурсии в параллелизованную рекурсию
+
+```java
+public<T> void sequentialRecursive(List<Node<T>> nodes,
+                                   Collection<T> results) {
+    for (Node<T> n : nodes) {
+        results.add(n.compute());
+        sequentialRecursive(n.getChildren(), results);
+    }
+}
+public<T> void parallelRecursive(final Executor exec,
+                                 List<Node<T>> nodes,
+                                 final Collection<T> results) {
+    for (final Node<T> n : nodes) {
+        exec.execute(new Runnable() {
+            public void run() {
+                results.add(n.compute());
+            }
+        });
+        parallelRecursive(exec, n.getChildren(), results);
+    }
+}
+```
+
+Когда parallelRecursive возвращается, это значит, что каждый узел в дереве был посещен (обход по-
+прежнему является последовательным: только вызовы метода compute выполняются параллельно), и вычисление 
+для каждого узла было поставлено в очередь в исполнителе. Элементы кода, вызывающие метод 
+parallelRecursive, могут ожидать все результаты, создав специфичный для обхода исполнитель и используя 
+методы shutdown и awaitTermination
+
+Ожидание результатов, которые будут вычислены параллельно
+
+```java
+public<T> Collection<T> getParallelResults(List<Node<T>> nodes)
+        throws InterruptedException {
+    ExecutorService exec = Executors.newCachedThreadPool();
+    Queue<T> resultQueue = new ConcurrentLinkedQueue<T>();
+    parallelRecursive(exec, nodes, resultQueue);
+    exec.shutdown();
+    exec.awaitTermination(Long.MAX_VALUE, TimeUnit.SECONDS);
+    return resultQueue;
+}
+```
+
+### 8.5.1. Пример: фреймворк головоломки
 
