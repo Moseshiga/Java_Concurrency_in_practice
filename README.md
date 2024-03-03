@@ -3470,3 +3470,71 @@ public<T> Collection<T> getParallelResults(List<Node<T>> nodes)
 
 ### 8.5.1. Пример: фреймворк головоломки
 
+Мы определяем головоломку как комбинацию начальной и целевой позиций и правил, определяющих допустимые 
+ходы. Множество правил состоит из двух частей: вычисление списка законных ходов из заданной позиции и 
+вычисление результата применения хода к позиции. Ниже показана абстракция головоломки. Параметры типа P и M 
+представляют классы для позиции и хода. Из этого интерфейса мы можем написать простой последовательный 
+решатель, который выполняет поиск в пространстве головоломки, до тех пор пока не будет найдено решение либо 
+пространство головоломки не будет исчерпано.
+
+Абстракция для головоломок, таких как «Скользящие блоки»
+
+```java
+public interface Puzzle<P, M> {
+    P initialPosition();
+    boolean isGoal(P position);
+    Set<M> legalMoves(P position);
+    P move(P position, M move);
+}
+```
+
+Конкурентная версия решателя головоломок
+
+```java
+public class ConcurrentPuzzleSolver<P, M> {
+    private final Puzzle<P, M> puzzle;
+    private final ExecutorService exec;
+    private final ConcurrentMap<P, Boolean> seen;
+    final ValueLatch<Node<P, M>> solution = new ValueLatch<Node<P, M>>();
+    ...
+    public List<M> solve() throws InterruptedException {
+        try {
+            P p = puzzle.initialPosition();
+            exec.execute(newTask(p, null, null));
+            // блокировать до тех пор, пока решение не будет найдено
+            Node<P, M> solnNode = solution.getValue();
+            return (solnNode == null) ? null : solnNode.asMoveList();
+        } finally {
+            exec.shutdown();
+        }
+    }
+    protected Runnable newTask(P p, M m, Node<P,M> n) {
+        return new SolverTask(p, m, n);
+    }
+    class SolverTask extends Node<P, M> implements Runnable {
+    ...
+        public void run() {
+            if (solution.isSet() || seen.putIfAbsent(pos, true) != null)
+                return; // already solved or seen this position
+            if (puzzle.isGoal(pos))
+                solution.setValue(this);
+            else
+                for (M m : puzzle.legalMoves(pos))
+                    exec.execute(newTask(puzzle.move(pos, m), m, this));
+        }
+    }
+}
+```
+
+
+**Итоги**
+
+Executor — это мощная и гибкая структура для конкурентного выполнения задач. Он предлагает ряд 
+регулировочных параметров, таких как политики для создания и удаления потоков, обработки задач в очереди и 
+действий с избыточными задачами, а также предоставляет несколько перехватчиков для расширения своего 
+поведения. Однако, как и в большинстве мощных структур, в нем существуют комбинации параметров, которые 
+плохо работают вместе: некоторые типы задач требуют специфических политик выполнения, а некоторые 
+комбинации регулировочных параметров могут привести к непредвиденным результатам.
+
+
+
